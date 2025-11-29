@@ -1,0 +1,6 @@
+logs
+processed_claims.csv
+processed_claims_output
+*.pyc
+.venv
+.pytest_cache
