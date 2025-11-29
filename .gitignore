@@ -4,3 +4,4 @@ processed_claims_output
 *.pyc
 .venv
 .pytest_cache
+.coverage
