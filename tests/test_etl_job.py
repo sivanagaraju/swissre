@@ -1,7 +1,8 @@
 import pytest
 import pytest
 import src.etl_job
-from src.etl_job import extract_data, transform_data, load_data
+from src.etl_job import extract_data, transform_data, load_data, get_hash
+from pyspark.sql.functions import lit
 
 from src.utils import load_config, rename_spark_output
 import os
@@ -54,24 +55,23 @@ def test_transformation_logic(spark):
     claims_path = os.path.join(base_dir, "data", "claims_data.csv")
     policyholders_path = os.path.join(base_dir, "data", "policyholder_data.csv")
     
-def test_fetch_hashes_for_claims():
-    """Test the fetch_hashes_for_claims function logic."""
-    with unittest.mock.patch('src.etl_job.requests.Session') as mock_session_cls:
-        mock_session = mock_session_cls.return_value
-        
+def test_get_hash():
+    """Test the get_hash function logic."""
+    # We mock requests.get directly since get_hash calls it
+    with unittest.mock.patch('src.etl_job.requests.get') as mock_get:
         # Test success case
         mock_response = unittest.mock.Mock()
         mock_response.status_code = 200
         mock_response.json.return_value = {"Digest": "12345hash"}
-        mock_session.get.return_value = mock_response
+        mock_get.return_value = mock_response
         
-        results = src.etl_job.fetch_hashes_for_claims(["CL_123"])
-        assert results == [("CL_123", "12345hash")]
+        result = get_hash("CL_123")
+        assert result == "12345hash"
         
         # Test failure case
-        mock_session.get.side_effect = Exception("API Error")
-        results = src.etl_job.fetch_hashes_for_claims(["CL_456"])
-        assert results == [("CL_456", "")]
+        mock_get.side_effect = Exception("API Error")
+        result = get_hash("CL_456")
+        assert result == ""
 
 
 def test_transformation_logic(spark):
@@ -82,10 +82,12 @@ def test_transformation_logic(spark):
     
     claims_df, policyholders_df = extract_data(spark, claims_path, policyholders_path)
     
-    def fake_fetch_hashes(claim_ids):
-        return [(cid, "mocked_md4_hash") for cid in claim_ids]
+    claims_df, policyholders_df = extract_data(spark, claims_path, policyholders_path)
+    
+    # Mock the UDF to return a literal column
+    with unittest.mock.patch('src.etl_job.get_hash_udf') as mock_udf:
+        mock_udf.side_effect = lambda c: lit("mocked_md4_hash")
         
-    with unittest.mock.patch('src.etl_job.fetch_hashes_for_claims', side_effect=fake_fetch_hashes):
         result_df = transform_data(claims_df, policyholders_df)
         
         # Verify output schema
@@ -164,12 +166,11 @@ def test_end_to_end_etl(spark):
     temp_output = tempfile.mkdtemp()
     output_path = os.path.join(temp_output, "test_output")
     
-    # Mock fetch_hashes_for_claims here too
-    def fake_fetch_hashes(claim_ids):
-        return [(cid, "mocked_hash") for cid in claim_ids]
-    
+    # Mock get_hash_udf here too
     try:
-        with unittest.mock.patch('src.etl_job.fetch_hashes_for_claims', side_effect=fake_fetch_hashes):
+        with unittest.mock.patch('src.etl_job.get_hash_udf') as mock_udf:
+            mock_udf.side_effect = lambda c: lit("mocked_hash")
+            
             # Run ETL
             claims_df, policyholders_df = extract_data(spark, claims_path, policyholders_path)
             final_df = transform_data(claims_df, policyholders_df)

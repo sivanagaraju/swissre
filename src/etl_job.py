@@ -1,12 +1,7 @@
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import col, when, udf, substring, split, date_format, lit, md5
-from pyspark.sql.types import StringType
+from pyspark.sql.functions import col, when, substring, split, date_format
 import logging
 import requests
-import json
-import tempfile
-import csv
-import os
 
 logger = logging.getLogger("ClaimsETL")
 
@@ -35,65 +30,66 @@ def extract_data(spark, claims_path, policyholders_path):
     
     return claims_df, policyholders_df
 
-def fetch_hashes_for_claims(claim_ids):
+def get_hash_with_session(session, claim_id):
     """
-    Fetches MD4 hashes for a list of claim_ids from an external API.
-    Returns a list of tuples: (claim_id, hash_id)
+    Fetches MD4 hash using provided session (for connection reuse).
+    Used by driver-side batching.
     """
-    logger.info(f"Fetching hashes for {len(claim_ids)} unique claims...")
-    results = []
-    # In a real scenario, we might batch these requests if the list is long
-    # or use an endpoint that accepts multiple IDs.
-    # For now, we'll iterate but on the driver side.
-    
-    # Using a session for connection pooling
+    if not claim_id:
+        return ""
+        
+    try:
+        url = f"https://api.hashify.net/hash/md4/hex?value={claim_id}"
+        response = session.get(url, timeout=10)
+        if response.status_code == 200:
+            return response.json().get("Digest", "")
+        return ""
+    except Exception as e:
+        logger.warning(f"Error fetching hash for {claim_id}: {e}")
+        return ""
+
+def fetch_hashes_in_batches(claim_ids, batch_size=100):
+    """
+    Fetches hashes for claim_ids in batches with connection pooling.
+    Runs on DRIVER to avoid worker serialization issues.
+    """
+    logger.info(f"Fetching hashes for {len(claim_ids)} unique claims in batches of {batch_size}...")
     session = requests.Session()
+    all_hashes = {}
     
-    for i, claim_id in enumerate(claim_ids):
-        if i % 10 == 0:
-            logger.info(f"Fetched {i}/{len(claim_ids)} hashes...")
-            
-        try:
-            url = f"https://api.hashify.net/hash/md4/hex?value={claim_id}"
-            response = session.get(url, timeout=10)
-            if response.status_code == 200:
-                hash_val = response.json().get("Digest", "")
-                results.append((claim_id, hash_val))
-            else:
-                results.append((claim_id, ""))
-        except Exception as e:
-            logger.error(f"Error fetching hash for {claim_id}: {e}")
-            results.append((claim_id, ""))
-            
-    return results
+    total_batches = (len(claim_ids) + batch_size - 1) // batch_size
+    
+    for i in range(0, len(claim_ids), batch_size):
+        batch = claim_ids[i:i+batch_size]
+        batch_num = i // batch_size + 1
+        logger.info(f"Processing batch {batch_num}/{total_batches}...")
+        
+        # Make batched requests with connection reuse
+        for claim_id in batch:
+            hash_val = get_hash_with_session(session, claim_id)
+            all_hashes[claim_id] = hash_val
+    
+    session.close()
+    logger.info(f"Successfully fetched {len(all_hashes)} hashes.")
+    return all_hashes
 
 def transform_data(claims_df, policyholders_df):
     """Applies the business transformations using PySpark DataFrame API."""
     logger.info("Starting data transformation using DataFrame API...")
     
-    # 1. Get unique claim IDs to fetch hashes for
-    # Collect to driver - assuming dataset fits in memory as per "small dataset" note
-    unique_claims = [row.claim_id for row in claims_df.select("claim_id").distinct().collect()]
+    # 1. Get UNIQUE claim_ids (deduplicate at driver)
+    unique_claims = [row.claim_id for row in 
+                    claims_df.select("claim_id").distinct().collect()]
     
-    # 2. Fetch hashes on driver
-    hashes_data = fetch_hashes_for_claims(unique_claims)
+    # 2. Fetch all hashes on DRIVER with connection pooling
+    hashes_dict = fetch_hashes_in_batches(unique_claims)
     
-    # 3. Create a DataFrame from the hashes
-    # Workaround: Write to temp CSV and read back to avoid createDataFrame worker crash
-    with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix=".csv") as tmp:
-        writer = csv.writer(tmp)
-        writer.writerow(["claim_id", "hash_id"])
-        writer.writerows(hashes_data)
-        tmp_path = tmp.name
-        
-    try:
-        spark = claims_df.sparkSession
-        hashes_df = spark.read.csv(tmp_path, header=True)
-    finally:
-        pass
+    # 3. Convert dict to DataFrame (avoid UDF serialization issues)
+    spark = claims_df.sparkSession
+    hashes_data = [(k, v) for k, v in hashes_dict.items()]
+    hashes_df = spark.createDataFrame(hashes_data, ["claim_id", "hash_id"])
     
     # 4. Join Claims and Policyholders
-    # Using left join as per requirement
     joined_df = claims_df.join(
         policyholders_df, 
         claims_df.policyholder_id == policyholders_df.policyholder_id, 
@@ -103,15 +99,14 @@ def transform_data(claims_df, policyholders_df):
         policyholders_df["policyholder_name"]
     )
     
-    # 5. Join with Hashes
+    # 5. Join with hashes (join instead of UDF to avoid serialization issues)
     joined_with_hashes_df = joined_df.join(
         hashes_df,
         "claim_id",
         "left"
     )
-    # joined_with_hashes_df = joined_df # Bypass hash join
     
-    # Apply Transformations
+    # 6. Apply Transformations
     final_df = joined_with_hashes_df.withColumn(
         "claim_type",
         when(col("claim_id").like("CL%"), "Coinsurance")
@@ -146,7 +141,7 @@ def transform_data(claims_df, policyholders_df):
     return final_df
 
 def load_data(df, output_path):
-    """Writes the result to a CSV file."""
+    """Writes the result to a Parquet file."""
     logger.info(f"Writing output to {output_path}")
-    # Coalesce to 1 to get a single CSV file as output (for this small dataset)
-    df.coalesce(1).write.csv(output_path, header=True, mode="overwrite")
+    # Coalesce to 1 to get a single Parquet file as output (for this small dataset)
+    df.coalesce(1).write.parquet(output_path, mode="overwrite")
