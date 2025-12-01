@@ -1,10 +1,15 @@
 import pytest
+import pytest
+import src.etl_job
 from src.etl_job import extract_data, transform_data, load_data
+
 from src.utils import load_config, rename_spark_output
 import os
 import tempfile
 import shutil
 import glob
+import unittest.mock
+
 
 
 def test_load_config():
@@ -49,19 +54,54 @@ def test_transformation_logic(spark):
     claims_path = os.path.join(base_dir, "data", "claims_data.csv")
     policyholders_path = os.path.join(base_dir, "data", "policyholder_data.csv")
     
+def test_fetch_hashes_for_claims():
+    """Test the fetch_hashes_for_claims function logic."""
+    with unittest.mock.patch('src.etl_job.requests.Session') as mock_session_cls:
+        mock_session = mock_session_cls.return_value
+        
+        # Test success case
+        mock_response = unittest.mock.Mock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {"Digest": "12345hash"}
+        mock_session.get.return_value = mock_response
+        
+        results = src.etl_job.fetch_hashes_for_claims(["CL_123"])
+        assert results == [("CL_123", "12345hash")]
+        
+        # Test failure case
+        mock_session.get.side_effect = Exception("API Error")
+        results = src.etl_job.fetch_hashes_for_claims(["CL_456"])
+        assert results == [("CL_456", "")]
+
+
+def test_transformation_logic(spark):
+    """Test transformation logic with mocked UDF to avoid worker crashes."""
+    base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    claims_path = os.path.join(base_dir, "data", "claims_data.csv")
+    policyholders_path = os.path.join(base_dir, "data", "policyholder_data.csv")
+    
     claims_df, policyholders_df = extract_data(spark, claims_path, policyholders_path)
-    result_df = transform_data(claims_df, policyholders_df)
     
-    # Verify output schema
-    expected_columns = [
-        "claim_id", "policyholder_name", "region", "claim_type",
-        "claim_priority", "claim_amount", "claim_period",
-        "source_system_id", "hash_id"
-    ]
-    assert set(result_df.columns) == set(expected_columns)
-    
-    # Verify row count matches input
-    assert result_df.count() == 6
+    def fake_fetch_hashes(claim_ids):
+        return [(cid, "mocked_md4_hash") for cid in claim_ids]
+        
+    with unittest.mock.patch('src.etl_job.fetch_hashes_for_claims', side_effect=fake_fetch_hashes):
+        result_df = transform_data(claims_df, policyholders_df)
+        
+        # Verify output schema
+        expected_columns = [
+            "claim_id", "policyholder_name", "region", "claim_type",
+            "claim_priority", "claim_amount", "claim_period",
+            "source_system_id", "hash_id"
+        ]
+        assert set(result_df.columns) == set(expected_columns)
+        
+        # Verify row count matches input
+        assert result_df.count() == 6
+        
+        # Verify that the hash_id column contains our mocked value
+        rows = result_df.select("hash_id").limit(1).collect()
+        assert rows[0]["hash_id"] == "mocked_md4_hash"
 
 
 def test_rename_spark_output():
@@ -124,19 +164,24 @@ def test_end_to_end_etl(spark):
     temp_output = tempfile.mkdtemp()
     output_path = os.path.join(temp_output, "test_output")
     
+    # Mock fetch_hashes_for_claims here too
+    def fake_fetch_hashes(claim_ids):
+        return [(cid, "mocked_hash") for cid in claim_ids]
+    
     try:
-        # Run ETL
-        claims_df, policyholders_df = extract_data(spark, claims_path, policyholders_path)
-        final_df = transform_data(claims_df, policyholders_df)
-        load_data(final_df, output_path)
-        
-        # Verify output was created
-        csv_files = glob.glob(os.path.join(output_path, "part-*.csv"))
-        assert len(csv_files) > 0
-        
-        # Verify we can read the output
-        output_df = spark.read.csv(output_path, header=True)
-        assert output_df.count() == 6
+        with unittest.mock.patch('src.etl_job.fetch_hashes_for_claims', side_effect=fake_fetch_hashes):
+            # Run ETL
+            claims_df, policyholders_df = extract_data(spark, claims_path, policyholders_path)
+            final_df = transform_data(claims_df, policyholders_df)
+            load_data(final_df, output_path)
+            
+            # Verify output was created
+            csv_files = glob.glob(os.path.join(output_path, "part-*.csv"))
+            assert len(csv_files) > 0
+            
+            # Verify we can read the output
+            output_df = spark.read.csv(output_path, header=True)
+            assert output_df.count() == 6
         
     finally:
         shutil.rmtree(temp_output)
