@@ -6,15 +6,14 @@ os.environ['PYSPARK_PYTHON'] = sys.executable
 os.environ['PYSPARK_DRIVER_PYTHON'] = sys.executable
 
 from src.etl_job import create_spark_session, extract_data, transform_data, load_data
-from src.utils import setup_logger, rename_spark_output, load_config
+from src.utils import setup_logger, rename_spark_output
 
 def main():
     # Setup logger
     logger = setup_logger()
     
-    # Load configuration manually
-    config = load_config("config/spark-defaults.conf")
-    spark = create_spark_session(config)
+    # Create Spark session with hardcoded configurations
+    spark = create_spark_session()
     
     # Define paths (assuming running from project root)
     base_dir = os.path.dirname(os.path.abspath(__file__))

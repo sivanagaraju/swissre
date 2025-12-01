@@ -1,29 +1,25 @@
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import col, when, udf, substring, split, date_format, lit, md5
+from pyspark.sql.functions import col, when, udf, split, date_format
 from pyspark.sql.types import StringType
 import logging
 import requests
-import json
-import tempfile
-import csv
-import os
 
 logger = logging.getLogger("ClaimsETL")
 
-def create_spark_session(config=None):
-    """Creates and returns a SparkSession with optional config."""
+def create_spark_session():
+    """Creates and returns a SparkSession with predefined configurations."""
     logger.info("Creating Spark Session...")
-    builder = SparkSession.builder
     
-    if config:
-        for key, value in config.items():
-            builder = builder.config(key, value)
-            
-    # Set default app name if not in config, though config usually has it
-    if not config or "spark.app.name" not in config:
-        builder = builder.appName("ClaimsProcessing")
-        
-    return builder.getOrCreate()
+    spark = SparkSession.builder \
+        .appName("ClaimsProcessing") \
+        .master("local[*]") \
+        .config("spark.eventLog.enabled", "true") \
+        .config("spark.eventLog.dir", "file:///c:/tmp/spark-events") \
+        .config("spark.history.fs.logDirectory", "file:///c:/tmp/spark-events") \
+        .config("spark.local.dir", "C:\\tmp\\spark_tmp_files") \
+        .getOrCreate()
+    
+    return spark
 
 def extract_data(spark, claims_path, policyholders_path):
     """Reads the input CSV files."""
@@ -35,65 +31,33 @@ def extract_data(spark, claims_path, policyholders_path):
     
     return claims_df, policyholders_df
 
-def fetch_hashes_for_claims(claim_ids):
+def get_hash_id(claim_id):
     """
-    Fetches MD4 hashes for a list of claim_ids from an external API.
-    Returns a list of tuples: (claim_id, hash_id)
+    Fetches MD4 hash for a single claim_id from an external API.
+    Returns the hash_id as a string, or empty string on error.
     """
-    logger.info(f"Fetching hashes for {len(claim_ids)} unique claims...")
-    results = []
-    # In a real scenario, we might batch these requests if the list is long
-    # or use an endpoint that accepts multiple IDs.
-    # For now, we'll iterate but on the driver side.
+    if not claim_id:
+        return ""
     
-    # Using a session for connection pooling
-    session = requests.Session()
-    
-    for i, claim_id in enumerate(claim_ids):
-        if i % 10 == 0:
-            logger.info(f"Fetched {i}/{len(claim_ids)} hashes...")
-            
-        try:
-            url = f"https://api.hashify.net/hash/md4/hex?value={claim_id}"
-            response = session.get(url, timeout=10)
-            if response.status_code == 200:
-                hash_val = response.json().get("Digest", "")
-                results.append((claim_id, hash_val))
-            else:
-                results.append((claim_id, ""))
-        except Exception as e:
-            logger.error(f"Error fetching hash for {claim_id}: {e}")
-            results.append((claim_id, ""))
-            
-    return results
+    try:
+        url = f"https://api.hashify.net/hash/md4/hex?value={claim_id}"
+        response = requests.get(url, timeout=10)
+        if response.status_code == 200:
+            return response.json().get("Digest", "")
+        else:
+            return ""
+    except Exception as e:
+        logger.error(f"Error fetching hash for {claim_id}: {e}")
+        return ""
 
 def transform_data(claims_df, policyholders_df):
     """Applies the business transformations using PySpark DataFrame API."""
     logger.info("Starting data transformation using DataFrame API...")
     
-    # 1. Get unique claim IDs to fetch hashes for
-    # Collect to driver - assuming dataset fits in memory as per "small dataset" note
-    unique_claims = [row.claim_id for row in claims_df.select("claim_id").distinct().collect()]
+    # Register the UDF for fetching hash_id
+    hash_udf = udf(get_hash_id, StringType())
     
-    # 2. Fetch hashes on driver
-    hashes_data = fetch_hashes_for_claims(unique_claims)
-    
-    # 3. Create a DataFrame from the hashes
-    # Workaround: Write to temp CSV and read back to avoid createDataFrame worker crash
-    with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix=".csv") as tmp:
-        writer = csv.writer(tmp)
-        writer.writerow(["claim_id", "hash_id"])
-        writer.writerows(hashes_data)
-        tmp_path = tmp.name
-        
-    try:
-        spark = claims_df.sparkSession
-        hashes_df = spark.read.csv(tmp_path, header=True)
-    finally:
-        pass
-    
-    # 4. Join Claims and Policyholders
-    # Using left join as per requirement
+    # Join Claims and Policyholders using left join as per requirement
     joined_df = claims_df.join(
         policyholders_df, 
         claims_df.policyholder_id == policyholders_df.policyholder_id, 
@@ -103,16 +67,8 @@ def transform_data(claims_df, policyholders_df):
         policyholders_df["policyholder_name"]
     )
     
-    # 5. Join with Hashes
-    joined_with_hashes_df = joined_df.join(
-        hashes_df,
-        "claim_id",
-        "left"
-    )
-    # joined_with_hashes_df = joined_df # Bypass hash join
-    
-    # Apply Transformations
-    final_df = joined_with_hashes_df.withColumn(
+    # Apply Transformations including hash_id from UDF
+    final_df = joined_df.withColumn(
         "claim_type",
         when(col("claim_id").like("CL%"), "Coinsurance")
         .when(col("claim_id").like("RX%"), "Reinsurance")
@@ -127,6 +83,9 @@ def transform_data(claims_df, policyholders_df):
     ).withColumn(
         "source_system_id",
         split(col("claim_id"), "_").getItem(1)
+    ).withColumn(
+        "hash_id",
+        hash_udf(col("claim_id"))
     )
     
     # Select final columns in specific order
